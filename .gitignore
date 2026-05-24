@@ -1,0 +1,6 @@
+__pycache__/
+
+# Model dan bobot besar
+*.keras
+*.h5
+*.pt
