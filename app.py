@@ -1,8 +1,16 @@
+import os
 import sys
+import json
+import tempfile
+import zipfile
 from pathlib import Path
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import cv2
 import numpy as np
+import torch
 import ultralytics
 from mss import mss
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
@@ -29,6 +37,67 @@ CLASSIFIER_CANDIDATES = (
 )
 
 
+def resolve_torch_device():
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def get_torch_gpu_diagnostics():
+    return (
+        f"python={sys.executable}\n"
+        f"torch={torch.__version__}\n"
+        f"torch_cuda={torch.version.cuda}\n"
+        f"cuda_available={torch.cuda.is_available()}\n"
+        f"device_count={torch.cuda.device_count()}"
+    )
+
+
+def require_torch_gpu():
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.current_device()
+            return "cuda:0"
+        torch.cuda.init()
+        return "cuda:0"
+    except Exception:
+        pass
+
+    if not torch.cuda.is_available():
+        return "cpu"
+    return "cuda:0"
+
+
+def parse_major_minor(version):
+    parts = version.split(".")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return 0, 0
+
+
+def is_native_windows_tensorflow_cpu_only(tf):
+    return sys.platform.startswith("win") and parse_major_minor(tf.__version__) >= (2, 11)
+
+
+def configure_tensorflow_device(tf):
+    if is_native_windows_tensorflow_cpu_only(tf):
+        try:
+            tf.config.set_visible_devices([], "GPU")
+        except Exception:
+            pass
+        return "CPU"
+
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        return "CPU"
+
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        return gpus[0].name
+    except Exception as exc:
+        raise RuntimeError(f"Gagal mengaktifkan GPU TensorFlow: {exc}") from exc
+
+
 def resolve_classifier_path():
     for path in CLASSIFIER_CANDIDATES:
         if path.exists():
@@ -50,7 +119,43 @@ def build_xception_architecture(tf):
     outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
     return tf.keras.Model(inputs=base_model.input, outputs=outputs)
 
-# ok 
+
+def remove_unsupported_keras_config(value):
+    if isinstance(value, dict):
+        return {
+            key: remove_unsupported_keras_config(item)
+            for key, item in value.items()
+            if key != "quantization_config"
+        }
+    if isinstance(value, list):
+        return [remove_unsupported_keras_config(item) for item in value]
+    return value
+
+
+def load_sanitized_keras_model(classifier_path, load_model_fn):
+    with zipfile.ZipFile(classifier_path, "r") as source_zip:
+        config = json.loads(source_zip.read("config.json"))
+        sanitized_config = remove_unsupported_keras_config(config)
+
+        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+
+        try:
+            with zipfile.ZipFile(temp_path, "w") as target_zip:
+                for info in source_zip.infolist():
+                    if info.filename == "config.json":
+                        target_zip.writestr(
+                            info,
+                            json.dumps(sanitized_config, separators=(",", ":")),
+                        )
+                    else:
+                        target_zip.writestr(info, source_zip.read(info.filename))
+
+            return load_model_fn(str(temp_path), compile=False)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+
 def load_classifier_model(classifier_path, tf):
     classifier_name = classifier_path.name
 
@@ -65,14 +170,13 @@ def load_classifier_model(classifier_path, tf):
             ) from exc
 
     loaders = []
+    loaders.append((f"tf.keras v{tf.__version__}", tf.keras.models.load_model))
     try:
         import keras
 
         loaders.append((f"Keras Standalone v{keras.__version__}", keras.models.load_model))
     except Exception:
         pass
-
-    loaders.append((f"tf.keras v{tf.__version__}", tf.keras.models.load_model))
 
     load_errors = []
     for loader_name, load_model_fn in loaders:
@@ -81,11 +185,18 @@ def load_classifier_model(classifier_path, tf):
         except Exception as exc:
             message = str(exc)
             load_errors.append(f"{loader_name}: {message}")
+            if "quantization_config" in message and classifier_name.endswith(".keras"):
+                try:
+                    return load_sanitized_keras_model(classifier_path, load_model_fn)
+                except Exception as sanitize_exc:
+                    load_errors.append(
+                        f"{loader_name} sanitized .keras: {sanitize_exc}"
+                    )
             if "Could not deserialize class" in message or "keras.src.models" in message:
                 raise RuntimeError(
                     "Model `.keras` tidak kompatibel dengan runtime Keras yang aktif.\n"
-                    "Biasanya ini terjadi karena model dibuat di Keras 3 tetapi dibuka di TensorFlow/Keras 2.x.\n"
-                    "Perbaikan: upgrade `tensorflow` dan `keras`, atau export ulang model ke format yang kompatibel."
+                    "Model ini dibuat dengan versi Keras yang lebih baru daripada runtime saat ini.\n"
+                    "Perbaikan: install Keras yang sama/lebih baru, atau export ulang model dengan versi Keras di environment ini."
                 ) from exc
 
     combined_errors = "\n".join(load_errors)
@@ -124,6 +235,7 @@ def load_tensorflow():
                 "pip install --upgrade tensorflow keras protobuf"
             ) from exc
         raise RuntimeError(f"Gagal import TensorFlow: {exc}") from exc
+    tf.get_logger().setLevel("ERROR")
     return tf
 
 
@@ -193,12 +305,17 @@ class ScreenProcessorThread(QThread):
         self.deepfake_classifier = None
         self.tf = None
         self.input_size = (299, 299)
+        self.yolo_device = None
+        self.tf_device = "CPU"
 
     def _load_models(self):
         validate_face_model_environment()
         classifier_path = resolve_classifier_path()
+        self.yolo_device = require_torch_gpu()
         self.tf = load_tensorflow()
+        self.tf_device = configure_tensorflow_device(self.tf)
         self.face_detector = YOLO(str(FACE_MODEL_PATH))
+        self.face_detector.to(self.yolo_device)
         self.deepfake_classifier = load_classifier_model(classifier_path, self.tf)
 
     def run(self):
@@ -244,6 +361,8 @@ class MainWindow(QMainWindow):
         self.face_detector = None
         self.deepfake_classifier = None
         self.input_size = (299, 299)
+        self.yolo_device = None
+        self.tf_device = "CPU"
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -301,8 +420,11 @@ class MainWindow(QMainWindow):
 
         validate_face_model_environment()
         classifier_path = resolve_classifier_path()
+        self.yolo_device = require_torch_gpu()
         self.tf = load_tensorflow()
+        self.tf_device = configure_tensorflow_device(self.tf)
         self.face_detector = YOLO(str(FACE_MODEL_PATH))
+        self.face_detector.to(self.yolo_device)
         self.deepfake_classifier = load_classifier_model(classifier_path, self.tf)
 
     def open_upload_mode(self):
