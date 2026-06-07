@@ -1,41 +1,41 @@
-import zipfile
 import os
 import shutil
+import zipfile
+from pathlib import Path
 
-print("--- Memulai Ekstraksi Bobot Mentah dari File .keras ---")
+print("--- Memulai ekstraksi bobot mentah dari file .keras ---")
 
-keras_model_path = "./xception_deepfake_best.keras"
-extract_dir = "./temp_extracted_keras"
-target_weights_name = "./xception_deepfake_weights.weights.h5"
+BASE_DIR = Path(__file__).resolve().parent
+keras_model_path = BASE_DIR / "xception_deepfake_best.keras"
+extract_dir = BASE_DIR / "temp_extracted_keras"
+target_weights_path = BASE_DIR / "xception_deepfake_weights.weights.h5"
 
-if not os.path.exists(keras_model_path):
-    print(f"❌ File tidak ditemukan: {keras_model_path}")
-    exit()
+if not keras_model_path.exists():
+    print(f"ERROR: File tidak ditemukan: {keras_model_path}")
+    raise SystemExit(1)
 
 try:
-    # 1. Ekstrak file .keras sebagai file ZIP biasa
-    with zipfile.ZipFile(keras_model_path, 'r') as zip_ref:
+    # 1. Ekstrak file .keras sebagai file ZIP biasa.
+    with zipfile.ZipFile(keras_model_path, "r") as zip_ref:
         zip_ref.extractall(extract_dir)
-    print("✓ Berhasil membongkar arsip .keras")
+    print("OK: Berhasil membongkar arsip .keras")
 
-    # 2. Cari file bobot di dalam struktur Keras 3
-    # Di Keras 3, file bobot biasanya berada di: model.weights.h5
-    source_weights_path = os.path.join(extract_dir, "model.weights.h5")
+    # 2. Cari file bobot di dalam struktur Keras 3.
+    source_weights_path = extract_dir / "model.weights.h5"
 
-    if os.path.exists(source_weights_path):
-        # 3. Pindahkan dan rename ke folder project utama
-        shutil.copy(source_weights_path, target_weights_name)
-        print(f"✓ BERHASIL EKSTRAK BOBOT! File tersimpan di: {target_weights_name}")
+    if source_weights_path.exists():
+        # 3. Salin dan rename ke folder project utama.
+        shutil.copy(source_weights_path, target_weights_path)
+        print(f"OK: Berhasil ekstrak bobot. File tersimpan di: {target_weights_path}")
     else:
-        print("❌ File 'model.weights.h5' tidak ditemukan di dalam arsip.")
-        # Cetak isi folder untuk inspeksi jika strukturnya berbeda
+        print("ERROR: File 'model.weights.h5' tidak ditemukan di dalam arsip.")
         print("Isi file arsip:", os.listdir(extract_dir))
 
-except Exception as e:
-    print(f"❌ Gagal mengekstrak bobot: {e}")
+except Exception as exc:
+    print(f"ERROR: Gagal mengekstrak bobot: {exc}")
+    raise SystemExit(1) from exc
 
 finally:
-    # Bersihkan folder sampah hasil ekstraksi
-    if os.path.exists(extract_dir):
+    if extract_dir.exists():
         shutil.rmtree(extract_dir)
-        print("✓ Membersihkan file sementara selesai.")
+        print("OK: Membersihkan file sementara selesai.")

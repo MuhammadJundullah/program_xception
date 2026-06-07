@@ -1,524 +1,741 @@
-import os
-import sys
-import json
-import tempfile
-import zipfile
-from pathlib import Path
+"""
+app.py — MainWindow dan entry point aplikasi Xception Deepfake Detector + SVM Classifier.
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+Struktur file:
+  models.py   — logic model (loading, inference, annotation)
+  threads.py  — QThread worker untuk real-time screen capture
+  widgets.py  — custom widget (IntroLogoWidget, UploadDropArea, DetectionResultPanel)
+  styles.py   — stylesheet Qt seluruh aplikasi
+  app.py      — MainWindow + entry point (file ini)
+"""
+
+import ctypes
+import sys
+from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
-import ultralytics
-from mss import mss
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
-    QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
-from ultralytics import YOLO
 
-BASE_DIR = Path(__file__).resolve().parent
-FACE_MODEL_PATH = BASE_DIR / "yolov8n-face.pt"
-CLASSIFIER_CANDIDATES = (
-    BASE_DIR / "xception_deepfake_best.keras",
-    BASE_DIR / "xception_deepfake_weights.weights.h5",
+from models import (
+    BASE_DIR,
+    annotate_frame,
+    build_result_summary,
+    configure_tensorflow_device,
+    load_classifier_model,
+    load_tensorflow,
+    require_torch_gpu,
+    resolve_classifier_path,
+    validate_face_model_environment,
+    FACE_MODEL_PATH,
 )
+from styles import APP_STYLESHEET
+from threads import CameraProcessorThread, ScreenProcessorThread, VideoProcessorThread
+from widgets import DetectionResultPanel, IntroLogoWidget, IntroVideoLabel, UploadDropArea
+
+# ── Konstanta Tambahan Untuk SVM ──────────────────────────────────────────────
+INTRO_VIDEO_PATH = BASE_DIR / "animasi_deepfake.mp4"
+INTRO_LOGO_PATH  = BASE_DIR / "logo_intro.png.png"
+
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 
-def resolve_torch_device():
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
+# ── Windows capture-exclusion helper ─────────────────────────────────────────
+
+def set_window_excluded_from_capture(window, excluded: bool) -> bool:
+    if not sys.platform.startswith("win"):
+        return True
+    hwnd = int(window.winId())
+    affinity = WDA_EXCLUDEFROMCAPTURE if excluded else WDA_NONE
+    return bool(ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, affinity))
 
 
-def get_torch_gpu_diagnostics():
-    return (
-        f"python={sys.executable}\n"
-        f"torch={torch.__version__}\n"
-        f"torch_cuda={torch.version.cuda}\n"
-        f"cuda_available={torch.cuda.is_available()}\n"
-        f"device_count={torch.cuda.device_count()}"
-    )
-
-
-def require_torch_gpu():
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.current_device()
-            return "cuda:0"
-        torch.cuda.init()
-        return "cuda:0"
-    except Exception:
-        pass
-
-    if not torch.cuda.is_available():
-        return "cpu"
-    return "cuda:0"
-
-
-def parse_major_minor(version):
-    parts = version.split(".")
-    try:
-        return int(parts[0]), int(parts[1])
-    except (IndexError, ValueError):
-        return 0, 0
-
-
-def is_native_windows_tensorflow_cpu_only(tf):
-    return sys.platform.startswith("win") and parse_major_minor(tf.__version__) >= (2, 11)
-
-
-def configure_tensorflow_device(tf):
-    if is_native_windows_tensorflow_cpu_only(tf):
-        try:
-            tf.config.set_visible_devices([], "GPU")
-        except Exception:
-            pass
-        return "CPU"
-
-    gpus = tf.config.list_physical_devices("GPU")
-    if not gpus:
-        return "CPU"
-
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        return gpus[0].name
-    except Exception as exc:
-        raise RuntimeError(f"Gagal mengaktifkan GPU TensorFlow: {exc}") from exc
-
-
-def resolve_classifier_path():
-    for path in CLASSIFIER_CANDIDATES:
-        if path.exists():
-            return path
-    searched = ", ".join(str(path.name) for path in CLASSIFIER_CANDIDATES)
-    raise FileNotFoundError(
-        f"Model classifier tidak ditemukan. Cari salah satu file ini di folder project: {searched}"
-    )
-
-
-def build_xception_architecture(tf):
-    base_model = tf.keras.applications.Xception(
-        weights=None,
-        include_top=False,
-        input_shape=(299, 299, 3),
-    )
-    x = base_model.output
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
-    return tf.keras.Model(inputs=base_model.input, outputs=outputs)
-
-
-def remove_unsupported_keras_config(value):
-    if isinstance(value, dict):
-        return {
-            key: remove_unsupported_keras_config(item)
-            for key, item in value.items()
-            if key != "quantization_config"
-        }
-    if isinstance(value, list):
-        return [remove_unsupported_keras_config(item) for item in value]
-    return value
-
-
-def load_sanitized_keras_model(classifier_path, load_model_fn):
-    with zipfile.ZipFile(classifier_path, "r") as source_zip:
-        config = json.loads(source_zip.read("config.json"))
-        sanitized_config = remove_unsupported_keras_config(config)
-
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as temp_file:
-            temp_path = Path(temp_file.name)
-
-        try:
-            with zipfile.ZipFile(temp_path, "w") as target_zip:
-                for info in source_zip.infolist():
-                    if info.filename == "config.json":
-                        target_zip.writestr(
-                            info,
-                            json.dumps(sanitized_config, separators=(",", ":")),
-                        )
-                    else:
-                        target_zip.writestr(info, source_zip.read(info.filename))
-
-            return load_model_fn(str(temp_path), compile=False)
-        finally:
-            temp_path.unlink(missing_ok=True)
-
-
-def load_classifier_model(classifier_path, tf):
-    classifier_name = classifier_path.name
-
-    if classifier_name.endswith(".weights.h5"):
-        try:
-            model = build_xception_architecture(tf)
-            model.load_weights(str(classifier_path))
-            return model
-        except Exception as exc:
-            raise RuntimeError(
-                f"Gagal memuat bobot mentah ke arsitektur Xception: {exc}"
-            ) from exc
-
-    loaders = []
-    loaders.append((f"tf.keras v{tf.__version__}", tf.keras.models.load_model))
-    try:
-        import keras
-
-        loaders.append((f"Keras Standalone v{keras.__version__}", keras.models.load_model))
-    except Exception:
-        pass
-
-    load_errors = []
-    for loader_name, load_model_fn in loaders:
-        try:
-            return load_model_fn(str(classifier_path), compile=False)
-        except Exception as exc:
-            message = str(exc)
-            load_errors.append(f"{loader_name}: {message}")
-            if "quantization_config" in message and classifier_name.endswith(".keras"):
-                try:
-                    return load_sanitized_keras_model(classifier_path, load_model_fn)
-                except Exception as sanitize_exc:
-                    load_errors.append(
-                        f"{loader_name} sanitized .keras: {sanitize_exc}"
-                    )
-            if "Could not deserialize class" in message or "keras.src.models" in message:
-                raise RuntimeError(
-                    "Model `.keras` tidak kompatibel dengan runtime Keras yang aktif.\n"
-                    "Model ini dibuat dengan versi Keras yang lebih baru daripada runtime saat ini.\n"
-                    "Perbaikan: install Keras yang sama/lebih baru, atau export ulang model dengan versi Keras di environment ini."
-                ) from exc
-
-    combined_errors = "\n".join(load_errors)
-    raise RuntimeError(
-        f"Gagal memuat model classifier '{classifier_name}'.\nDetail percobaan:\n{combined_errors}"
-    )
-
-
-def validate_face_model_environment():
-    if not FACE_MODEL_PATH.exists():
-        raise FileNotFoundError(f"File model wajah tidak ditemukan: {FACE_MODEL_PATH.name}")
-
-    if FACE_MODEL_PATH.name.startswith("yolov11"):
-        try:
-            from ultralytics.nn.modules import block as yolo_block
-        except Exception as exc:
-            raise RuntimeError(f"Gagal memeriksa modul Ultralytics: {exc}") from exc
-
-        if not hasattr(yolo_block, "C3k2"):
-            raise RuntimeError(
-                "Model 'yolov11n-face.pt' membutuhkan versi Ultralytics yang lebih baru. "
-                f"Versi terpasang saat ini: {ultralytics.__version__}. "
-                "Upgrade package `ultralytics` atau gunakan weight yang cocok."
-            )
-
-
-def load_tensorflow():
-    try:
-        import tensorflow as tf
-    except ImportError as exc:
-        message = str(exc)
-        if "runtime_version" in message and "google.protobuf" in message:
-            raise RuntimeError(
-                "TensorFlow gagal diimport karena protobuf tidak kompatibel.\n"
-                "Perbaiki environment dengan menjalankan:\n"
-                "pip install --upgrade tensorflow keras protobuf"
-            ) from exc
-        raise RuntimeError(f"Gagal import TensorFlow: {exc}") from exc
-    tf.get_logger().setLevel("ERROR")
-    return tf
-
-
-def annotate_frame(
-    frame,
-    face_detector,
-    deepfake_classifier,
-    tf,
-    input_size=(299, 299),
-    confidence_threshold=0.25,
-):
-    annotated = frame.copy()
-    results = face_detector(annotated, verbose=False)[0]
-
-    for box in results.boxes:
-        confidence = float(box.conf[0]) if box.conf is not None else 0.0
-        if confidence < confidence_threshold:
-            continue
-
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        h, w, _ = annotated.shape
-        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-
-        face_roi = annotated[y1:y2, x1:x2]
-        if face_roi.size == 0:
-            continue
-
-        face_resized = cv2.resize(face_roi, input_size)
-        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
-        face_array = tf.keras.preprocessing.image.img_to_array(face_rgb)
-        face_array = np.expand_dims(face_array, axis=0)
-        face_array = face_array / 255.0
-
-        prediction_raw = deepfake_classifier.predict(face_array, verbose=0)
-        prediction = float(np.asarray(prediction_raw).squeeze())
-        prediction = max(0.0, min(1.0, prediction))
-
-        if prediction > 0.5:
-            label = f"DEEPFAKE: {prediction * 100:.1f}%"
-            color = (0, 0, 255)
-        else:
-            label = f"REAL: {(1 - prediction) * 100:.1f}%"
-            color = (0, 255, 0)
-
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
-        cv2.putText(
-            annotated,
-            label,
-            (x1, max(20, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-        )
-
-    return annotated
-
-
-class ScreenProcessorThread(QThread):
-    change_pixmap_signal = pyqtSignal(np.ndarray)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._run_flag = True
-        self.face_detector = None
-        self.deepfake_classifier = None
-        self.tf = None
-        self.input_size = (299, 299)
-        self.yolo_device = None
-        self.tf_device = "CPU"
-
-    def _load_models(self):
-        validate_face_model_environment()
-        classifier_path = resolve_classifier_path()
-        self.yolo_device = require_torch_gpu()
-        self.tf = load_tensorflow()
-        self.tf_device = configure_tensorflow_device(self.tf)
-        self.face_detector = YOLO(str(FACE_MODEL_PATH))
-        self.face_detector.to(self.yolo_device)
-        self.deepfake_classifier = load_classifier_model(classifier_path, self.tf)
-
-    def run(self):
-        try:
-            self._load_models()
-
-            with mss() as sct:
-                if len(sct.monitors) < 2:
-                    raise RuntimeError("Monitor untuk screen capture tidak terdeteksi.")
-
-                monitor = sct.monitors[1]
-
-                while self._run_flag:
-                    sct_img = sct.grab(monitor)
-                    frame = np.array(sct_img)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    annotated = annotate_frame(
-                        frame,
-                        self.face_detector,
-                        self.deepfake_classifier,
-                        self.tf,
-                        self.input_size,
-                    )
-                    self.change_pixmap_signal.emit(annotated)
-        except Exception as exc:
-            self._run_flag = False
-            self.error_signal.emit(str(exc))
-
-    def stop(self):
-        self._run_flag = False
-        self.wait()
-
+# ── MainWindow ────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Real-Time Screen Deepfake Detector")
-        self.setGeometry(100, 100, 1024, 768)
+        self.setWindowTitle("Xception Deepfake Detector")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+        self.setGeometry(150, 150, 1000, 680)
+        self.setMinimumSize(880, 600)
 
+        # State Modifikasi
         self.thread = None
+        self.video_thread = None
+        self.camera_thread = None
         self.current_mode = None
         self.tf = None
         self.face_detector = None
-        self.deepfake_classifier = None
+        self.deepfake_classifier = None  # Full Xception .keras model
+        
         self.input_size = (299, 299)
         self.yolo_device = None
         self.tf_device = "CPU"
+        self.capture_exclusion_enabled = False
+        self._pending_image_path = None
 
+        # Root
         self.central_widget = QWidget()
+        self.central_widget.setObjectName("AppRoot")
         self.setCentralWidget(self.central_widget)
-        self.layout = QVBoxLayout(self.central_widget)
+        self._root_layout = QVBoxLayout(self.central_widget)
+        self._root_layout.setContentsMargins(24, 20, 24, 20)
+        self._root_layout.setSpacing(14)
 
+        self.setStyleSheet(APP_STYLESHEET)
+
+        # Stack
         self.stack = QStackedWidget(self)
-        self.layout.addWidget(self.stack)
+        self._root_layout.addWidget(self.stack)
 
+        self._build_intro_page()
+        self._build_menu_page()
+        self._build_upload_viewer_page()
+        self._build_realtime_viewer_page()
+        self._build_camera_viewer_page()
+
+        self.stack.setCurrentWidget(self.intro_page)
+        self._start_intro()
+
+    # ── Page builders ─────────────────────────────────────────────────────────
+
+    def _build_intro_page(self):
+        self.intro_page = QWidget()
+        self.intro_page.setObjectName("IntroPage")
+        layout = QVBoxLayout(self.intro_page)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        if INTRO_LOGO_PATH.exists():
+            self._intro_widget = IntroLogoWidget(INTRO_LOGO_PATH, self)
+            self._intro_widget.finished.connect(self._on_intro_finished)
+            layout.addWidget(self._intro_widget, 0, Qt.AlignmentFlag.AlignCenter)
+        else:
+            self._intro_widget = IntroLogoWidget(INTRO_LOGO_PATH, self)
+            self._intro_widget.finished.connect(self._on_intro_finished)
+            layout.addWidget(self._intro_widget, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.stack.addWidget(self.intro_page)
+
+    def _build_menu_page(self):
         self.menu_page = QWidget()
-        self.menu_layout = QVBoxLayout(self.menu_page)
-        self.menu_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.menu_page.setObjectName("MenuPage")
+        layout = QVBoxLayout(self.menu_page)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(14)
 
-        self.title_label = QLabel("Pilih Mode Deteksi", self)
-        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.menu_layout.addWidget(self.title_label)
+        brand = QLabel("Program Skripsi", self)
+        brand.setObjectName("BrandLabel")
+        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(brand)
 
-        self.upload_mode_btn = QPushButton("Upload Gambar", self)
-        self.upload_mode_btn.clicked.connect(self.open_upload_mode)
-        self.menu_layout.addWidget(self.upload_mode_btn)
+        title = QLabel("Realtime Deepfake Detector (Xception)", self)
+        title.setObjectName("TitleLabel")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
 
-        self.realtime_mode_btn = QPushButton("Realtime", self)
-        self.realtime_mode_btn.clicked.connect(self.open_realtime_mode)
-        self.menu_layout.addWidget(self.realtime_mode_btn)
+        sub = QLabel(
+            "Upload gambar/video untuk analisis statis, atau pantau layar/kamera secara real-time\n"
+            "Deteksi menggunakan arsitektur Xception murni untuk klasifikasi wajah REAL/DEEPFAKE.",
+            self,
+        )
+        sub.setObjectName("SubtitleLabel")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
 
-        self.viewer_page = QWidget()
-        self.viewer_layout = QVBoxLayout(self.viewer_page)
+        divider = QFrame(self)
+        divider.setObjectName("Divider")
+        divider.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(divider)
 
-        self.image_label = QLabel(self)
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.viewer_layout.addWidget(self.image_label)
+        upload_btn = QPushButton("   ↑   Upload Gambar / Video", self)
+        upload_btn.setObjectName("PrimaryButton")
+        upload_btn.setMinimumHeight(46)
+        upload_btn.clicked.connect(self.open_upload_mode)
+        layout.addWidget(upload_btn)
 
-        self.button_row = QHBoxLayout()
+        realtime_btn = QPushButton("   ◉   Realtime Screening", self)
+        realtime_btn.setObjectName("SecondaryButton")
+        realtime_btn.setMinimumHeight(46)
+        realtime_btn.clicked.connect(self.open_realtime_mode)
+        layout.addWidget(realtime_btn)
 
-        self.back_btn = QPushButton("Kembali ke Menu", self)
-        self.back_btn.clicked.connect(self.back_to_menu)
-        self.button_row.addWidget(self.back_btn)
-
-        self.upload_btn = QPushButton("Pilih Gambar", self)
-        self.upload_btn.clicked.connect(self.select_image)
-        self.button_row.addWidget(self.upload_btn)
-
-        self.toggle_btn = QPushButton("Start Screening", self)
-        self.toggle_btn.clicked.connect(self.toggle_screening)
-        self.button_row.addWidget(self.toggle_btn)
-
-        self.viewer_layout.addLayout(self.button_row)
+        camera_btn = QPushButton("   📷   Camera Screening", self)
+        camera_btn.setObjectName("SecondaryButton")
+        camera_btn.setMinimumHeight(46)
+        camera_btn.clicked.connect(self.open_camera_mode)
+        layout.addWidget(camera_btn)
 
         self.stack.addWidget(self.menu_page)
-        self.stack.addWidget(self.viewer_page)
+
+    def _build_upload_viewer_page(self):
+        self.upload_page = QWidget()
+        self.upload_page.setObjectName("ViewerPage")
+        outer = QVBoxLayout(self.upload_page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+
+        header = QHBoxLayout()
+        self._upload_title = QLabel("Upload Gambar / Video", self)
+        self._upload_title.setObjectName("SectionTitle")
+        icon = QLabel("↑", self)
+        icon.setObjectName("SectionTitle")
+        header.addWidget(icon)
+        header.addWidget(self._upload_title)
+        header.addStretch()
+        self._upload_status = QLabel("Ready", self)
+        self._upload_status.setObjectName("StatusPill")
+        header.addWidget(self._upload_status)
+        outer.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+
+        self.drop_area = UploadDropArea(self)
+        self.drop_area.file_selected.connect(self._on_file_selected)
+        left_col.addWidget(self.drop_area)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self._detect_btn = QPushButton("   🔍   Detect Deepfake", self)
+        self._detect_btn.setObjectName("PrimaryButton")
+        self._detect_btn.setMinimumHeight(44)
+        self._detect_btn.setEnabled(False)
+        self._detect_btn.clicked.connect(self._run_upload_detection)
+        btn_row.addWidget(self._detect_btn, 1)
+
+        self._export_btn = QPushButton("   💾   Export Video", self)
+        self._export_btn.setObjectName("SecondaryButton")
+        self._export_btn.setMinimumHeight(44)
+        self._export_btn.setEnabled(False)
+        self._export_btn.hide()
+        self._export_btn.clicked.connect(self._run_video_export)
+        btn_row.addWidget(self._export_btn, 1)
+
+        self._clear_btn = QPushButton("🗑", self)
+        self._clear_btn.setObjectName("DangerOutlineButton")
+        self._clear_btn.setMinimumHeight(44)
+        self._clear_btn.setFixedWidth(46)
+        self._clear_btn.clicked.connect(self._clear_upload)
+        btn_row.addWidget(self._clear_btn)
+
+        left_col.addLayout(btn_row)
+
+        hint = QLabel("🛡 File diproses lokal menggunakan model Xception .keras", self)
+        hint.setObjectName("UploadSubText")
+        left_col.addWidget(hint)
+
+        left_col.addStretch()
+        body.addLayout(left_col, 1)
+
+        right_col = QVBoxLayout()
+        right_col.setSpacing(10)
+
+        hasil_title = QLabel("Hasil Deteksi", self)
+        hasil_title.setObjectName("SectionTitle")
+        icon2 = QLabel("📊", self)
+        icon2.setObjectName("SectionTitle")
+
+        title_row = QHBoxLayout()
+        title_row.addWidget(icon2)
+        title_row.addWidget(hasil_title)
+        title_row.addStretch()
+        right_col.addLayout(title_row)
+
+        self._upload_image_label = QLabel(self)
+        self._upload_image_label.setObjectName("PreviewSurface")
+        self._upload_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._upload_image_label.setMinimumSize(380, 260)
+        self._upload_image_label.setText("Gambar hasil deteksi muncul di sini")
+        right_col.addWidget(self._upload_image_label, 1)
+
+        self._result_scroll = QScrollArea(self)
+        self._result_scroll.setWidgetResizable(True)
+        self._result_scroll.setMaximumHeight(200)
+        self._result_panel = DetectionResultPanel(self)
+        self._result_scroll.setWidget(self._result_panel)
+        self._result_scroll.hide()
+        right_col.addWidget(self._result_scroll)
+
+        body.addLayout(right_col, 1)
+        outer.addLayout(body, 1)
+
+        back_btn = QPushButton("← Kembali ke Menu", self)
+        back_btn.setObjectName("GhostButton")
+        back_btn.setMinimumHeight(38)
+        back_btn.clicked.connect(self.back_to_menu)
+        outer.addWidget(back_btn)
+
+        self.stack.addWidget(self.upload_page)
+
+    def _build_realtime_viewer_page(self):
+        self.realtime_page = QWidget()
+        self.realtime_page.setObjectName("ViewerPage")
+        layout = QVBoxLayout(self.realtime_page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        rt_title = QLabel("Realtime Screening", self)
+        rt_title.setObjectName("ViewerTitle")
+        header.addWidget(rt_title)
+        header.addStretch()
+        self._rt_status = QLabel("Idle", self)
+        self._rt_status.setObjectName("StatusPill")
+        header.addWidget(self._rt_status)
+        layout.addLayout(header)
+
+        self._rt_image_label = QLabel(self)
+        self._rt_image_label.setObjectName("PreviewSurface")
+        self._rt_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._rt_image_label.setMinimumSize(540, 360)
+        self._rt_image_label.setText("Realtime preview")
+        layout.addWidget(self._rt_image_label, 1)
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(10)
+
+        back_btn = QPushButton("← Kembali", self)
+        back_btn.setObjectName("GhostButton")
+        back_btn.setMinimumHeight(40)
+        back_btn.clicked.connect(self.back_to_menu)
+        ctrl_row.addWidget(back_btn)
+
+        self._toggle_btn = QPushButton("▶   Start Screening", self)
+        self._toggle_btn.setObjectName("PrimaryButton")
+        self._toggle_btn.setMinimumHeight(40)
+        self._toggle_btn.clicked.connect(self._toggle_screening)
+        ctrl_row.addWidget(self._toggle_btn, 1)
+
+        fps_lbl = QLabel("FPS", self)
+        fps_lbl.setObjectName("ControlLabel")
+        ctrl_row.addWidget(fps_lbl)
+
+        self._fps_spinbox = QSpinBox(self)
+        self._fps_spinbox.setObjectName("FpsSpinBox")
+        self._fps_spinbox.setRange(5, 60)
+        self._fps_spinbox.setValue(30)
+        self._fps_spinbox.setSuffix(" fps")
+        self._fps_spinbox.setMinimumHeight(40)
+        self._fps_spinbox.setFixedWidth(100)
+        ctrl_row.addWidget(self._fps_spinbox)
+
+        layout.addLayout(ctrl_row)
+        self.stack.addWidget(self.realtime_page)
+
+    def _build_camera_viewer_page(self):
+        self.camera_page = QWidget()
+        self.camera_page.setObjectName("ViewerPage")
+        layout = QVBoxLayout(self.camera_page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        cam_title = QLabel("Camera Screening", self)
+        cam_title.setObjectName("ViewerTitle")
+        header.addWidget(cam_title)
+        header.addStretch()
+        self._cam_status = QLabel("Idle", self)
+        self._cam_status.setObjectName("StatusPill")
+        header.addWidget(self._cam_status)
+        layout.addLayout(header)
+
+        self._cam_image_label = QLabel(self)
+        self._cam_image_label.setObjectName("PreviewSurface")
+        self._cam_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cam_image_label.setMinimumSize(540, 360)
+        self._cam_image_label.setText("Camera preview")
+        layout.addWidget(self._cam_image_label, 1)
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(10)
+
+        back_btn = QPushButton("← Kembali", self)
+        back_btn.setObjectName("GhostButton")
+        back_btn.setMinimumHeight(40)
+        back_btn.clicked.connect(self.back_to_menu)
+        ctrl_row.addWidget(back_btn)
+
+        self._cam_toggle_btn = QPushButton("⏹   Stop Camera", self)
+        self._cam_toggle_btn.setObjectName("PrimaryButton")
+        self._cam_toggle_btn.setMinimumHeight(40)
+        self._cam_toggle_btn.clicked.connect(self._toggle_camera)
+        ctrl_row.addWidget(self._cam_toggle_btn, 1)
+
+        layout.addLayout(ctrl_row)
+        self.stack.addWidget(self.camera_page)
+
+    def _start_intro(self):
+        self._intro_widget.start()
+
+    def _on_intro_finished(self):
         self.stack.setCurrentWidget(self.menu_page)
 
-    def ensure_models_loaded(self):
-        if self.face_detector is not None and self.deepfake_classifier is not None and self.tf is not None:
-            return
-
-        validate_face_model_environment()
-        classifier_path = resolve_classifier_path()
-        self.yolo_device = require_torch_gpu()
-        self.tf = load_tensorflow()
-        self.tf_device = configure_tensorflow_device(self.tf)
-        self.face_detector = YOLO(str(FACE_MODEL_PATH))
-        self.face_detector.to(self.yolo_device)
-        self.deepfake_classifier = load_classifier_model(classifier_path, self.tf)
+    # ── Navigation ────────────────────────────────────────────────────────────
 
     def open_upload_mode(self):
-        self.stop_screening_if_needed()
+        self._stop_screening_if_needed()
         self.current_mode = "upload"
-        self.image_label.clear()
-        self.upload_btn.show()
-        self.toggle_btn.hide()
-        self.stack.setCurrentWidget(self.viewer_page)
+        self._pending_image_path = None
+        self.drop_area.clear_preview()
+        self._upload_image_label.clear()
+        self._upload_image_label.setText("Gambar hasil deteksi muncul di sini")
+        self._upload_status.setText("Ready")
+        self._detect_btn.setEnabled(False)
+        self._result_scroll.hide()
+        self._result_panel.clear()
+        self.stack.setCurrentWidget(self.upload_page)
 
     def open_realtime_mode(self):
-        self.stop_screening_if_needed()
+        self._stop_screening_if_needed()
         self.current_mode = "realtime"
-        self.image_label.clear()
-        self.upload_btn.hide()
-        self.toggle_btn.show()
-        self.toggle_btn.setText("Start Screening")
-        self.stack.setCurrentWidget(self.viewer_page)
+        self._rt_image_label.clear()
+        self._rt_image_label.setText("Realtime preview")
+        self._rt_status.setText("Idle")
+        self._toggle_btn.setText("▶   Start Screening")
+        self.stack.setCurrentWidget(self.realtime_page)
+
+    def open_camera_mode(self):
+        self._stop_screening_if_needed()
+        self.current_mode = "camera"
+        self._cam_image_label.clear()
+        self._cam_image_label.setText("Connecting to camera...")
+        self._cam_status.setText("Connecting")
+        self.stack.setCurrentWidget(self.camera_page)
+        # Langsung jalankan kamera
+        QTimer.singleShot(100, self._toggle_camera)
 
     def back_to_menu(self):
-        self.stop_screening_if_needed()
+        self._stop_screening_if_needed()
         self.current_mode = None
-        self.image_label.clear()
+        self._rt_status.setText("Idle")
+        self._cam_status.setText("Idle")
         self.stack.setCurrentWidget(self.menu_page)
 
-    def stop_screening_if_needed(self):
-        if self.thread is not None and self.thread.isRunning():
-            self.thread.stop()
-        self.thread = None
-        self.toggle_btn.setText("Start Screening")
+    # ── Upload mode logic ──────────────────────────────────────────────────────
 
-    def toggle_screening(self):
-        if self.current_mode != "realtime":
+    def _on_file_selected(self, path: str):
+        self._pending_image_path = path
+        self.drop_area.set_preview(path)
+        self._detect_btn.setEnabled(True)
+        
+        suffix = Path(path).suffix.lower()
+        is_video = suffix in {".mp4", ".avi", ".mov", ".mkv"}
+        if is_video:
+            self._export_btn.show()
+            self._export_btn.setEnabled(True)
+        else:
+            self._export_btn.hide()
+            self._export_btn.setEnabled(False)
+
+        self._upload_status.setText("Siap dideteksi")
+        self._result_scroll.hide()
+        self._result_panel.clear()
+        self._upload_image_label.clear()
+        self._upload_image_label.setText("Gambar hasil deteksi muncul di sini")
+
+    def _clear_upload(self):
+        self._pending_image_path = None
+        self.drop_area.clear_preview()
+        self._detect_btn.setEnabled(False)
+        self._export_btn.hide()
+        self._export_btn.setEnabled(False)
+        self._upload_status.setText("Ready")
+        self._result_scroll.hide()
+        self._result_panel.clear()
+        self._upload_image_label.clear()
+        self._upload_image_label.setText("Gambar hasil deteksi muncul di sini")
+
+    def _run_upload_detection(self):
+        if not self._pending_image_path:
             return
 
-        if self.thread is not None and self.thread.isRunning():
-            self.stop_screening_if_needed()
-            self.image_label.clear()
+        suffix = Path(self._pending_image_path).suffix.lower()
+        is_video = suffix in {".mp4", ".avi", ".mov", ".mkv"}
+
+        self._upload_status.setText("Memproses…")
+        self._detect_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+        self._clear_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        if is_video:
+            self._run_video_detection()
+        else:
+            self._run_image_detection()
+
+    def _run_video_export(self):
+        if not self._pending_image_path:
             return
 
-        self.toggle_btn.setText("Stop Screening")
-        self.thread = ScreenProcessorThread()
-        self.thread.change_pixmap_signal.connect(self.update_image)
-        self.thread.error_signal.connect(self.handle_thread_error)
-        self.thread.start()
-
-    def select_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(
+        from PyQt6.QtWidgets import QFileDialog
+        save_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Pilih Gambar",
-            str(BASE_DIR),
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
+            "Simpan Hasil Deteksi Video",
+            f"result_{Path(self._pending_image_path).stem}.mp4",
+            "Video Files (*.mp4)"
         )
-        if not file_path:
+        
+        if not save_path:
             return
 
+        self._upload_status.setText("Exporting…")
+        self._detect_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+        self._clear_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        self._run_video_detection(output_path=save_path)
+
+    def _run_image_detection(self):
         try:
-            self.ensure_models_loaded()
-            file_bytes = np.fromfile(file_path, dtype=np.uint8)
+            self._ensure_models_loaded()
+            file_bytes = np.fromfile(self._pending_image_path, dtype=np.uint8)
             frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
             if frame is None:
                 raise RuntimeError("File gambar tidak bisa dibaca.")
 
-            annotated = annotate_frame(
+            # Menggunakan model Xception langsung
+            annotated, detections = annotate_frame(
                 frame,
                 self.face_detector,
                 self.deepfake_classifier,
                 self.tf,
                 self.input_size,
+                return_detections=True,
+                mode="upload"
             )
-            self.update_image(annotated)
-        except Exception as exc:
-            QMessageBox.critical(self, "Model Error", str(exc))
 
-    def update_image(self, cv_img):
+            self._upload_status.setText("Analyzed")
+            self._update_upload_image(annotated)
+            self._result_panel.show_results(detections)
+            self._result_scroll.show()
+
+        except Exception as exc:
+            self._upload_status.setText("Error")
+            QMessageBox.critical(self, "Model Error", str(exc))
+        finally:
+            self._detect_btn.setEnabled(True)
+            self._clear_btn.setEnabled(True)
+
+    def _run_video_detection(self, output_path=None):
+        self._ensure_models_loaded()
+        self.video_thread = VideoProcessorThread(
+            self._pending_image_path, 
+            output_path=output_path,
+            face_detector=self.face_detector,
+            feature_extractor=self.deepfake_classifier
+        )
+        self.video_thread.change_pixmap_signal.connect(self._update_upload_image)
+        self.video_thread.progress_signal.connect(self._on_video_progress)
+        self.video_thread.finished_signal.connect(self._on_video_finished)
+        self.video_thread.error_signal.connect(self._handle_video_error)
+        self.video_thread.start()
+
+    def _on_video_progress(self, progress: int):
+        status_text = "Exporting" if (self.video_thread and self.video_thread.output_path) else "Memproses"
+        self._upload_status.setText(f"{status_text} {progress}%")
+
+    def _on_video_finished(self, detections: list):
+        self._upload_status.setText("Analyzed")
+        self._result_panel.show_results(detections)
+        self._result_scroll.show()
+        self._detect_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
+        self._clear_btn.setEnabled(True)
+        
+        if self.video_thread and self.video_thread.output_path:
+            QMessageBox.information(self, "Export Berhasil", f"Video hasil deteksi disimpan ke:\n{self.video_thread.output_path}")
+
+        self.video_thread = None
+
+    def _handle_video_error(self, message: str):
+        self._upload_status.setText("Error")
+        QMessageBox.critical(self, "Video Error", message)
+        self._detect_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
+        self._clear_btn.setEnabled(True)
+        self.video_thread = None
+
+    def _update_upload_image(self, cv_img):
         h, w, ch = cv_img.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(cv_img.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
+        qt_image = QImage(cv_img.data, w, h, ch * w, QImage.Format.Format_BGR888)
         scaled = qt_image.scaled(
-            self.image_label.width(),
-            self.image_label.height(),
+            self._upload_image_label.width(),
+            self._upload_image_label.height(),
             Qt.AspectRatioMode.KeepAspectRatio,
         )
-        self.image_label.setPixmap(QPixmap.fromImage(scaled))
+        self._upload_image_label.setPixmap(QPixmap.fromImage(scaled))
 
-    def handle_thread_error(self, message):
-        self.stop_screening_if_needed()
-        self.image_label.clear()
+    # ── Realtime mode logic ────────────────────────────────────────────────────
+
+    def _toggle_screening(self):
+        if self.thread is not None and self.thread.isRunning():
+            self._stop_screening_if_needed()
+            self._rt_image_label.clear()
+            self._rt_image_label.setText("Realtime preview")
+            return
+
+        if not self._enable_capture_exclusion():
+            QMessageBox.warning(
+                self,
+                "Screen Capture",
+                "Windows tidak mengizinkan aplikasi ini dikecualikan dari screen capture.\n"
+                "Pindahkan jendela aplikasi dari area yang ingin dideteksi.",
+            )
+
+        self._ensure_models_loaded()
+        self._toggle_btn.setText("⏹   Stop Screening")
+        self._rt_status.setText("Screening")
+        
+        self.thread = ScreenProcessorThread(
+            face_detector=self.face_detector,
+            feature_extractor=self.deepfake_classifier
+        )
+        self.thread.target_fps = self._fps_spinbox.value()
+        self.thread.change_pixmap_signal.connect(self._update_realtime_image)
+        self.thread.error_signal.connect(self._handle_thread_error)
+        self.thread.start()
+
+    def _update_realtime_image(self, cv_img):
+        h, w, ch = cv_img.shape
+        qt_image = QImage(cv_img.data, w, h, ch * w, QImage.Format.Format_BGR888)
+        scaled = qt_image.scaled(
+            self._rt_image_label.width(),
+            self._rt_image_label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        self._rt_image_label.setPixmap(QPixmap.fromImage(scaled))
+
+    # ── Camera mode logic ──────────────────────────────────────────────────────
+
+    def _toggle_camera(self):
+        if self.camera_thread is not None and self.camera_thread.isRunning():
+            self._stop_screening_if_needed()
+            self._cam_image_label.clear()
+            self._cam_image_label.setText("Camera preview")
+            return
+
+        self._ensure_models_loaded()
+        self._cam_toggle_btn.setText("⏹   Stop Camera")
+        self._cam_status.setText("Streaming")
+        
+        self.camera_thread = CameraProcessorThread(
+            camera_index=0,
+            face_detector=self.face_detector,
+            feature_extractor=self.deepfake_classifier
+        )
+        self.camera_thread.change_pixmap_signal.connect(self._update_camera_image)
+        self.camera_thread.error_signal.connect(self._handle_thread_error)
+        self.camera_thread.start()
+
+    def _update_camera_image(self, cv_img):
+        h, w, ch = cv_img.shape
+        qt_image = QImage(cv_img.data, w, h, ch * w, QImage.Format.Format_BGR888)
+        scaled = qt_image.scaled(
+            self._cam_image_label.width(),
+            self._cam_image_label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        self._cam_image_label.setPixmap(QPixmap.fromImage(scaled))
+
+    def _handle_thread_error(self, message: str):
+        self._stop_screening_if_needed()
+        self._rt_image_label.clear()
+        self._rt_image_label.setText("Realtime preview")
         QMessageBox.critical(self, "Model Error", message)
 
+    # ── Shared helpers ────────────────────────────────────────────────────────
+
+    def _ensure_models_loaded(self):
+        """Memuat semua model, kini menggunakan Xception murni tanpa SVM."""
+        if (self.face_detector is not None and 
+            self.deepfake_classifier is not None and 
+            self.tf is not None):
+            return
+            
+        validate_face_model_environment()
+        classifier_path = resolve_classifier_path()
+        self.yolo_device = require_torch_gpu()
+        
+        self.tf = load_tensorflow()
+        self.tf_device = configure_tensorflow_device(self.tf)
+        
+        # 1. Load YOLO Face Detector
+        from ultralytics import YOLO
+        self.face_detector = YOLO(str(FACE_MODEL_PATH))
+        self.face_detector.to(self.yolo_device)
+        
+        # 2. Load Full Xception Classifier (.keras)
+        print("Loading Xception Classifier Model...")
+        self.deepfake_classifier = load_classifier_model(classifier_path, self.tf)
+        print("Semua komponen model (YOLO + Xception) berhasil dimuat!")
+
+    def _stop_screening_if_needed(self):
+        if self.thread is not None and self.thread.isRunning():
+            self.thread.stop()
+        self.thread = None
+
+        if self.video_thread is not None and self.video_thread.isRunning():
+            self.video_thread.stop()
+        self.video_thread = None
+
+        if self.camera_thread is not None and self.camera_thread.isRunning():
+            self.camera_thread.stop()
+        self.camera_thread = None
+
+        self._disable_capture_exclusion()
+        self._toggle_btn.setText("▶   Start Screening")
+        self._rt_status.setText("Idle")
+        self._cam_toggle_btn.setText("▶   Start Camera")
+        self._cam_status.setText("Idle")
+
+    def _enable_capture_exclusion(self) -> bool:
+        if self.capture_exclusion_enabled:
+            return True
+        enabled = set_window_excluded_from_capture(self, True)
+        self.capture_exclusion_enabled = enabled
+        return enabled
+
+    def _disable_capture_exclusion(self):
+        if not self.capture_exclusion_enabled:
+            return
+        set_window_excluded_from_capture(self, False)
+        self.capture_exclusion_enabled = False
+
     def closeEvent(self, event):
-        self.stop_screening_if_needed()
+        self._stop_screening_if_needed()
+        if hasattr(self._intro_widget, "_stop"):
+            self._intro_widget._stop()
+        elif hasattr(self._intro_widget, "stop"):
+            self._intro_widget.stop()
         event.accept()
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
